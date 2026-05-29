@@ -1,0 +1,70 @@
+name: Build
+
+# 触发条件：
+# 1. 推送到 main 分支时自动构建
+# 2. 在 GitHub Actions 页面手动点击 "Run workflow"
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+
+  # ── macOS 构建 ────────────────────────────────────────────────────────────
+  build-macos:
+    name: macOS (.app)
+    runs-on: macos-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install pyinstaller streamlit openpyxl
+
+      - name: 打包
+        run: pyinstaller i18n_tool_mac.spec --distpath dist --workpath build --noconfirm
+
+      - name: 压缩 .app（Actions 上传需要打包为 zip）
+        run: |
+          cd dist
+          zip -r "i18n清理工具-macOS.zip" "i18n清理工具.app"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: i18n清理工具-macOS
+          path: dist/i18n清理工具-macOS.zip
+          retention-days: 30   # 保留 30 天
+
+  # ── Windows 构建 ──────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows (.exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install pyinstaller streamlit openpyxl
+
+      - name: 打包
+        run: pyinstaller i18n_tool_win.spec --distpath dist --workpath build --noconfirm
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: i18n清理工具-Windows
+          path: dist/i18n清理工具.exe
+          retention-days: 30
