@@ -32,8 +32,8 @@ from sanitize_i18n_xlsx import (
 INVISIBLE_NAMES = {
     "​": "零宽空格 U+200B",
     "﻿": "BOM U+FEFF",
-    " ": "行分隔符 U+2028",
-    " ": "段落分隔符 U+2029",
+    "": "行分隔符 U+2028",
+    "": "段落分隔符 U+2029",
 }
 
 TAG_SHORT = {
@@ -629,13 +629,16 @@ def render_summary(changes: list, warn_items: list) -> None:
         for wt, _ in msgs:
             warn_type_counts[wt] += 1
 
-    # 手动修改计数
-    n_edited = len(st.session_state.get("cell_edits", {}))
+    n_edited    = len(st.session_state.get("cell_edits", {}))
+    cleanup     = st.session_state.results.get("cleanup", {})
+    del_rows    = sum(v["rows"] for v in cleanup.values())
+    del_cols    = sum(v["cols"] for v in cleanup.values())
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("✅ 自动修改", len(changes))
     c2.metric("⚠️ 警告", len(warn_items))
     c3.metric("✏️ 手动修改", n_edited)
+    c4.metric("🗑️ 删除空行/列", f"{del_rows} 行 / {del_cols} 列")
     st.divider()
 
     col_a, col_b = st.columns(2)
@@ -734,16 +737,17 @@ def main() -> None:
     if st.button("🚀 开始处理", type="primary", use_container_width=True):
         with st.spinner("处理中，请稍候…"):
             wb = openpyxl.load_workbook(io.BytesIO(uploaded.getvalue()))
-            changes, warn_items = process_workbook(wb)
+            changes, warn_items, cleanup = process_workbook(wb)
             output = io.BytesIO()
             wb.save(output)
 
         st.session_state.results = {
             "changes":    changes,
             "warn_items": warn_items,
+            "cleanup":    cleanup,
             "output":     output.getvalue(),
             "filename":   uploaded.name,
-            "live_wb":    wb,          # 保留 workbook 对象供手动编辑
+            "live_wb":    wb,
         }
         _reset_filters()
 

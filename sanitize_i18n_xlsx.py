@@ -183,13 +183,69 @@ Change   = tuple[str, int, int, str, str, str, str, set[str]]   # +col_idx at [2
 WarnItem = tuple[str, int, int, str, str, str, list[tuple[str, str]]]  # +col_idx at [2]
 
 
-def process_workbook(wb) -> tuple[list[Change], list[WarnItem]]:
+def _is_empty_cell(cell) -> bool:
+    """判断单元格是否为空（None 或纯空白字符串）。"""
+    v = cell.value
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+
+def _real_bounds(ws) -> tuple[int, int]:
+    """
+    从 ws._cells（只含已赋值单元格）快速算出实际数据边界，
+    跳过 Excel 保存的虚假大尺寸（如 A1:XFD1048576）。
+    返回 (max_row, max_col)；全空时返回 (0, 0)。
+    """
+    max_r = max_c = 0
+    for (r, c), cell in ws._cells.items():
+        if cell is not None and cell.value is not None:
+            if r > max_r: max_r = r
+            if c > max_c: max_c = c
+    return max_r, max_c
+
+
+def _clean_empty_cells(ws) -> dict[str, int]:
+    """
+    在实际数据范围内删除完全空的行（第 2 行起）和列。
+    从后往前删除，避免索引偏移。
+    返回 {"rows": 删除行数, "cols": 删除列数}。
+    """
+    max_row, max_col = _real_bounds(ws)
+    if max_row == 0:
+        return {"rows": 0, "cols": 0}
+
+    # 空行（第 2 行起，在真实行列范围内扫描）
+    empty_rows = [
+        cells[0].row
+        for cells in ws.iter_rows(min_row=2, max_row=max_row, max_col=max_col)
+        if all(_is_empty_cell(c) for c in cells)
+    ]
+    for r in reversed(empty_rows):
+        ws.delete_rows(r)
+
+    # 空列（删行后重新计算边界，避免行号偏移影响判断）
+    max_row2, max_col2 = _real_bounds(ws)
+    if max_col2 == 0:
+        return {"rows": len(empty_rows), "cols": 0}
+
+    empty_cols = [
+        cells[0].column
+        for cells in ws.iter_cols(min_row=1, max_row=max_row2, max_col=max_col2)
+        if all(_is_empty_cell(c) for c in cells)
+    ]
+    for c in reversed(empty_cols):
+        ws.delete_cols(c)
+
+    return {"rows": len(empty_rows), "cols": len(empty_cols)}
+
+
+def process_workbook(wb) -> tuple[list[Change], list[WarnItem], dict[str, dict]]:
     """
     遍历 workbook 所有工作表，对每个文案单元格执行 process_cell。
     直接修改传入的 workbook 对象，同时返回变更列表和警告列表。
     """
     changes:    list[Change]   = []
     warn_items: list[WarnItem] = []
+    cleanup:    dict           = {}   # {sheet_name: {"rows": n, "cols": n}}
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -235,7 +291,12 @@ def process_workbook(wb) -> tuple[list[Change], list[WarnItem]]:
                 if cell_warnings:
                     warn_items.append((sheet_name, cell.row, cell.column, key, col_header, new_val, cell_warnings))
 
-    return changes, warn_items
+        # 每张表处理完后清理空行/空列
+        result = _clean_empty_cells(ws)
+        if result["rows"] or result["cols"]:
+            cleanup[sheet_name] = result
+
+    return changes, warn_items, cleanup
 
 
 # ── 主处理流程（CLI 入口）────────────────────────────────────────────────────
@@ -245,7 +306,7 @@ def sanitize(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
     wb = openpyxl.load_workbook(dst)
-    changes, warn_items = process_workbook(wb)
+    changes, warn_items, cleanup = process_workbook(wb)
     wb.save(dst)
 
     print(f"\n输出文件：{dst}\n")
@@ -297,8 +358,13 @@ def sanitize(src: Path, dst: Path) -> None:
     print("─" * 44)
     print("  处理总结")
     print("─" * 44)
+    total_del_rows = sum(v["rows"] for v in cleanup.values())
+    total_del_cols = sum(v["cols"] for v in cleanup.values())
     print(f"  修改单元格  {len(changes):>6} 个")
     print(f"  警告单元格  {len(warn_items):>6} 个")
+    if total_del_rows or total_del_cols:
+        print(f"  删除空行    {total_del_rows:>6} 行")
+        print(f"  删除空列    {total_del_cols:>6} 列")
     print()
     print("  变更类型：")
     for tag in (TAG_INVISIBLE, TAG_NORMALIZE, TAG_NEWLINE, TAG_MIXED):
