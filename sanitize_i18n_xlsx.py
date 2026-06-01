@@ -22,6 +22,7 @@ sanitize_i18n_xlsx.py
 """
 
 import argparse
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -47,10 +48,16 @@ INVISIBLE_CHARS = (
 TAG_INVISIBLE = "不可见字符删除"
 TAG_NORMALIZE = "换行符统一为真实换行"
 TAG_NEWLINE   = "首尾换行符去除"
+TAG_MIXED     = "首尾换行与空格去除"
 
 # 警告类型标签
-WARN_MIXED = "首尾换行与空格混合"
-WARN_SPACE = "首尾仅含空格"
+WARN_MIXED       = "首尾换行与空格混合"   # 保留常量供历史兼容，不再由核心产生
+WARN_SPACE       = "首尾仅含空格"
+WARN_KEY_FORMAT  = "Key 格式错误"
+WARN_EMPTY_VALUE = "语言值为空"
+
+# key 合法格式：仅小写字母与下划线
+_KEY_RE = re.compile(r'^[a-z0-9_]+$')
 
 
 # ── 格式化辅助 ───────────────────────────────────────────────────────────────
@@ -145,11 +152,12 @@ def process_cell(val: str) -> tuple[str, set[str], list[tuple[str, str]]]:
     # 首部处理
     lead_type = classify_edge(leading)
     if lead_type == "newline_only":
-        # 只有换行符 → 自动去除
         val = val[len(leading):]
         tags.add(TAG_NEWLINE)
     elif lead_type == "mixed":
-        warnings.append((WARN_MIXED, f"行首：{repr(leading)}"))
+        # 换行与空格混合 → 自动去除所有首部空白
+        val = val.lstrip("\n \t")
+        tags.add(TAG_MIXED)
     elif lead_type == "space_only":
         warnings.append((WARN_SPACE, f"行首：{repr(leading)}"))
 
@@ -157,11 +165,12 @@ def process_cell(val: str) -> tuple[str, set[str], list[tuple[str, str]]]:
     _, trailing = _extract_edges(val)
     trail_type = classify_edge(trailing)
     if trail_type == "newline_only":
-        # 只有换行符 → 自动去除
         val = val[:len(val) - len(trailing)]
         tags.add(TAG_NEWLINE)
     elif trail_type == "mixed":
-        warnings.append((WARN_MIXED, f"行尾：{repr(trailing)}"))
+        # 换行与空格混合 → 自动去除所有尾部空白
+        val = val.rstrip("\n \t")
+        tags.add(TAG_MIXED)
     elif trail_type == "space_only":
         warnings.append((WARN_SPACE, f"行尾：{repr(trailing)}"))
 
@@ -170,8 +179,8 @@ def process_cell(val: str) -> tuple[str, set[str], list[tuple[str, str]]]:
 
 # ── 核心处理：workbook 级别（供 CLI 和 GUI 共用）───────────────────────────
 
-Change   = tuple[str, int, str, str, str, str, set[str]]
-WarnItem = tuple[str, int, str, str, str, list[tuple[str, str]]]
+Change   = tuple[str, int, int, str, str, str, str, set[str]]   # +col_idx at [2]
+WarnItem = tuple[str, int, int, str, str, str, list[tuple[str, str]]]  # +col_idx at [2]
 
 
 def process_workbook(wb) -> tuple[list[Change], list[WarnItem]]:
@@ -188,9 +197,28 @@ def process_workbook(wb) -> tuple[list[Change], list[WarnItem]]:
         header_row = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
 
         for row in ws.iter_rows(min_row=2):
-            key = str(row[1].value) if len(row) > 1 else ""
+            raw_key = row[1].value if len(row) > 1 else None
+            key = str(raw_key) if raw_key is not None else ""
+            row_num = row[0].row
+
+            # ── Key 格式校验 ─────────────────────────────────────
+            key_col = row[1].column if len(row) > 1 else 2
+            if not key:
+                warn_items.append((sheet_name, row_num, key_col, key, "Key", key,
+                                   [(WARN_KEY_FORMAT, "Key 为空")]))
+            elif not _KEY_RE.match(key):
+                warn_items.append((sheet_name, row_num, key_col, key, "Key", key,
+                                   [(WARN_KEY_FORMAT, "只允许小写字母、数字和下划线")]))
 
             for cell in row[2:]:
+                # ── 空值校验（处理前检查原始值）──────────────────
+                if cell.value is None or (isinstance(cell.value, str)
+                                          and cell.value.strip() == ""):
+                    col_h = str(header_row[cell.column - 1] or f"列{cell.column}").replace("\n", " ").strip()
+                    warn_items.append((sheet_name, cell.row, cell.column, key, col_h, "",
+                                       [(WARN_EMPTY_VALUE, "翻译值为空")]))
+                    continue
+
                 val = cell.value
                 if not isinstance(val, str):
                     continue
@@ -201,11 +229,11 @@ def process_workbook(wb) -> tuple[list[Change], list[WarnItem]]:
                 col_header = str(col_header).replace("\n", " ").strip()
 
                 if new_val != val:
-                    changes.append((sheet_name, cell.row, key, col_header, val, new_val, tags))
+                    changes.append((sheet_name, cell.row, cell.column, key, col_header, val, new_val, tags))
                     cell.value = new_val
 
                 if cell_warnings:
-                    warn_items.append((sheet_name, cell.row, key, col_header, new_val, cell_warnings))
+                    warn_items.append((sheet_name, cell.row, cell.column, key, col_header, new_val, cell_warnings))
 
     return changes, warn_items
 
@@ -225,7 +253,7 @@ def sanitize(src: Path, dst: Path) -> None:
     if changes:
         print("【变更】")
         cur_sheet = None
-        for sheet, row, key, col, old, new, tags in changes:
+        for sheet, row, col_idx, key, col, old, new, tags in changes:
             if sheet != cur_sheet:
                 print(f"┌─ {sheet}")
                 cur_sheet = sheet
@@ -241,7 +269,7 @@ def sanitize(src: Path, dst: Path) -> None:
         print()
         print("【警告】（需人工确认，未自动处理）")
         cur_sheet = None
-        for sheet, row, key, col, val, msgs in warn_items:
+        for sheet, row, col_idx, key, col, val, msgs in warn_items:
             if sheet != cur_sheet:
                 print(f"┌─ {sheet}")
                 cur_sheet = sheet
@@ -255,12 +283,12 @@ def sanitize(src: Path, dst: Path) -> None:
     tag_counts:          dict[str, int] = defaultdict(int)
     warn_type_counts:    dict[str, int] = defaultdict(int)
 
-    for _, _, _, _, _, _, tags in changes:
+    for _, _, _, _, _, _, _, tags in changes:
         for tag in tags:
             tag_counts[tag] += 1
     for sheet, *_ in changes:
         sheet_change_counts[sheet] += 1
-    for sheet, _, _, _, _, msgs in warn_items:
+    for sheet, _, _, _, _, _, msgs in warn_items:
         sheet_warn_counts[sheet] += 1
         for warn_type, _ in msgs:
             warn_type_counts[warn_type] += 1
@@ -273,14 +301,14 @@ def sanitize(src: Path, dst: Path) -> None:
     print(f"  警告单元格  {len(warn_items):>6} 个")
     print()
     print("  变更类型：")
-    for tag in (TAG_INVISIBLE, TAG_NORMALIZE, TAG_NEWLINE):
+    for tag in (TAG_INVISIBLE, TAG_NORMALIZE, TAG_NEWLINE, TAG_MIXED):
         count = tag_counts.get(tag, 0)
         if count:
             print(f"    {tag:<16}  {count:>6} 个")
     if warn_type_counts:
         print()
         print("  警告类型：")
-        for kind in (WARN_MIXED, WARN_SPACE):
+        for kind in (WARN_MIXED, WARN_SPACE, WARN_KEY_FORMAT, WARN_EMPTY_VALUE):
             count = warn_type_counts.get(kind, 0)
             if count:
                 print(f"    {kind:<16}  {count:>6} 个")
